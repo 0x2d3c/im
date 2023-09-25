@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"runtime"
 	"sync"
-	"sync/atomic"
 
 	"github.com/gorilla/websocket"
 )
@@ -24,8 +23,13 @@ type WebsocketMgr struct {
 
 // UserPool represents a pool of WebSocket users.
 type UserPool struct {
-	users     *atomic.Value // Atomic value to store user connections.
+	users     sync.Map      // Atomic value to store user connections.
 	messageCh chan *Message // Channel for handling messages within this user pool.
+}
+
+type User struct {
+	devices   sync.Map      // Atomic value to store user device connections.
+	messageCh chan *Message // Channel for handling messages within this user.
 }
 
 // Message represents a WebSocket message.
@@ -40,6 +44,7 @@ type Message struct {
 var (
 	numPools = 2 * runtime.NumCPU() // Number of user pools based on CPU cores.
 	wsMgr    = &WebsocketMgr{
+		log:        slog.Default(),
 		messageCh:  make(chan *Message),
 		upgrader:   websocket.Upgrader{},
 		messageBuf: sync.Pool{New: func() interface{} { return &Message{} }},
@@ -52,9 +57,7 @@ func init() {
 
 	// Initialize user pools and start message dispatchers for each pool.
 	for i := 0; i < numPools; i++ {
-		v := &atomic.Value{}
-		v.Store(make(map[string]*websocket.Conn))
-		wsMgr.users[i] = &UserPool{users: v, messageCh: make(chan *Message)}
+		wsMgr.users[i] = &UserPool{messageCh: make(chan *Message)}
 
 		go wsMgr.messageDispatcher(wsMgr.users[i])
 	}
@@ -84,28 +87,41 @@ func hashIndex(id string) uint32 {
 	return h.Sum32() % uint32(numPools)
 }
 
-func (pool *UserPool) userDeviceJoin(userID, device string, conn *websocket.Conn) {
-	users := pool.users.Load().(map[string]*websocket.Conn)
-
-	userCopies := make(map[string]*websocket.Conn)
-	for k, v := range users {
-		if k == userID+device {
-			v.Close()
-			continue
+func (pool *UserPool) userDeviceJoin(userID, deviceType string, conn *websocket.Conn) {
+	pool.users.Range(func(uid, user any) bool {
+		if uid != userID {
+			return true
 		}
-		userCopies[k] = v
+
+		user.(*User).devices.Store(deviceType, conn)
+
+		return false
+	})
+
+	user, ok := pool.users.Load(userID)
+
+	if !ok {
+		u := &User{
+			devices:   sync.Map{},
+			messageCh: make(chan *Message),
+		}
+
+		u.devices.Store(deviceType, conn)
+
+		pool.users.Store(userID, u)
+	} else {
+
+		user.(*User).devices.Store(deviceType, conn)
+
+		pool.users.Store(userID, user)
 	}
 
-	userCopies[userID+device] = conn
-
-	pool.users.Store(userCopies)
-
-	pool.handleConnection(userID, conn, device)
+	pool.handleConnection(userID, conn, deviceType)
 }
 
-func (pool *UserPool) handleConnection(userID string, conn *websocket.Conn, device string) {
+func (pool *UserPool) handleConnection(userID string, conn *websocket.Conn, deviceType string) {
 	defer func() {
-		pool.userDeviceLeft(userID, device)
+		pool.userDeviceLeft(userID, deviceType)
 	}()
 
 	for {
@@ -116,8 +132,8 @@ func (pool *UserPool) handleConnection(userID string, conn *websocket.Conn, devi
 			break
 		}
 
-		message.Device = device
 		message.Sender = userID
+		message.Device = deviceType
 
 		for i := range message.Receivers {
 			wsMgr.users[hashIndex(message.Receivers[i])].messageCh <- message
@@ -127,20 +143,16 @@ func (pool *UserPool) handleConnection(userID string, conn *websocket.Conn, devi
 	}
 }
 
-func (pool *UserPool) userDeviceLeft(userID, device string) {
-	users := pool.users.Load().(map[string]*websocket.Conn)
-
-	userCopies := make(map[string]*websocket.Conn)
-
-	for k, v := range users {
-		if k == userID+device {
-			v.Close()
-			continue
+func (pool *UserPool) userDeviceLeft(userID, deviceType string) {
+	pool.users.Range(func(uid, user any) bool {
+		if uid != userID {
+			return true
 		}
-		userCopies[k] = v
-	}
 
-	pool.users.Store(userCopies)
+		user.(*User).devices.Delete(deviceType)
+
+		return false
+	})
 }
 
 func (mgr *WebsocketMgr) getMessageFromPool() *Message {
@@ -151,15 +163,30 @@ func (mgr *WebsocketMgr) messageDispatcher(pool *UserPool) {
 	for {
 		select {
 		case message := <-pool.messageCh:
-			users := pool.users.Load().(map[string]*websocket.Conn)
-			for k, conn := range users {
-				if k == message.Sender+message.Device {
-					continue
+			pool.users.Range(func(uid, user any) bool {
+				for i := 0; i < len(message.Receivers); i++ {
+					if uid == message.Receivers[i] {
+						user.(*User).devices.Range(func(device, conn any) bool {
+							if err := conn.(*websocket.Conn).WriteJSON(message); err != nil {
+								wsMgr.log.Error("dropped message", slog.String("err", err.Error()), slog.Any("data", message))
+							}
+							return true
+						})
+					}
 				}
-				if err := conn.WriteJSON(message); err != nil {
-					wsMgr.log.Error("dropped message", slog.String("err", err.Error()), slog.Any("data", message))
+				if uid == message.Sender {
+					user.(*User).devices.Range(func(device, conn any) bool {
+						if device == message.Device {
+							return true
+						}
+						if err := conn.(*websocket.Conn).WriteJSON(message); err != nil {
+							wsMgr.log.Error("dropped message", slog.String("err", err.Error()), slog.Any("data", message))
+						}
+						return true
+					})
 				}
-			}
+				return true
+			})
 		case <-mgr.done:
 			return
 		}
